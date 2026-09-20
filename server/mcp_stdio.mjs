@@ -28,9 +28,11 @@ const SERVER_VERSION = "0.1.0"
 const DEFAULT_STARTUP_TIMEOUT_MS = 10000
 const BROWSER_EXIT_TIMEOUT_MS = 2000
 const CHILD_STDERR_LIMIT = 8192
-const READ_TIMEOUT_MS = 2000
+// A paused browser renderer can take several seconds to relay a memory view
+// through its UI/worker boundary. This must exceed the UI-side request budget.
+const READ_TIMEOUT_MS = Number(process.env.READ_TIMEOUT_MS || 20000)
 const MUTATION_RESPONSE_MARGIN_MS = 1000
-const COMMAND_TIMEOUT_MS = Number(process.env.COMMAND_TIMEOUT_MS || 10000)
+const COMMAND_TIMEOUT_MS = Number(process.env.COMMAND_TIMEOUT_MS || 15000)
 const MUTATION_TIMEOUT_MS = COMMAND_TIMEOUT_MS + MUTATION_RESPONSE_MARGIN_MS
 // Mounting asks the renderer for fresh status before it performs the mount.
 // A rejected image then needs one more fresh-status request to confirm that no
