@@ -1191,6 +1191,124 @@ test("setBreakpoint treats incompatible creation readback as uncertain", async (
   assert.equal(requests, 2)
 })
 
+test("setWatchpoint confirms access semantics and safely reuses only an exact match", async () => {
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  const requests = []
+  let current = []
+  core.request = async (pathname, options = {}) => {
+    requests.push({ pathname, options })
+    if (pathname !== "/api/debug/breakpoints") throw new Error(`Unexpected request ${pathname}`)
+    if (!options.method) return { emulator: core.identity, state: current }
+    const createdWatchpoint = { ...options.body, breakpointId: "bp:4660" }
+    current = [createdWatchpoint]
+    return { emulator: core.identity, state: createdWatchpoint }
+  }
+
+  const created = await core.setWatchpoint(0x1234, true, false)
+  assert.deepEqual(created.value, { address: 0x1234, breakpointId: "bp:4660" })
+  assert.equal(requests[1].options.body.watchpoint, true)
+  assert.equal(requests[1].options.body.instruction, false)
+  assert.equal(requests[1].options.body.memget, true)
+  assert.equal(requests[1].options.body.memset, false)
+
+  const reused = await core.setWatchpoint(0x1234, true, false)
+  assert.deepEqual(reused, created)
+  assert.equal(requests.length, 3)
+
+  await assert.rejects(core.setWatchpoint(0x1234, false, true), /incompatible debugger entry/)
+  current = [{ ...current[0], watchpoint: false }]
+  await assert.rejects(core.setWatchpoint(0x1234, true, false), /incompatible debugger entry/)
+  assert.equal(await core.serializeMutation(async () => "still usable"), "still usable")
+  assert.equal(requests.length, 5)
+})
+
+test("setWatchpoint refuses no-op requests and confirms the created watchpoint", async () => {
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  let requests = 0
+  core.request = async (pathname, options = {}) => {
+    requests += 1
+    if (!options.method) return { emulator: core.identity, state: [] }
+    return { emulator: core.identity, state: { ...options.body, disabled: true } }
+  }
+
+  await assert.rejects(core.setWatchpoint(0x1234, false, false), /must observe reads, writes, or both/)
+  assert.equal(requests, 0)
+  await assert.rejects(core.setWatchpoint(0x1234, true, false), /did not confirm the requested watchpoint/)
+  await assert.rejects(core.serializeMutation(async () => "still blocked"), /call stop_session, then start_session/)
+  assert.equal(requests, 2)
+})
+
+test("save-state MCP operations call existing API endpoints and classify import failures as uncertain", async () => {
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  const requests = []
+  core.request = async (pathname, options = {}) => {
+    requests.push({ pathname, options })
+    if (pathname === "/api/save-states/export") {
+      return {
+        emulator: core.identity,
+        state: { filename: "wasteland.a2ts", mimeType: "text/plain", dataBase64: "eyJ2ZXJzaW9uIjoyfQ==" },
+      }
+    }
+    if (pathname === "/api/save-states/import") {
+      return {
+        emulator: core.identity,
+        state: {
+          runMode: "paused",
+          speedMode: 0,
+          machineName: "APPLE2EE",
+          ramWorksKb: 64,
+          debugEnabled: false,
+          showDebugPanel: false,
+          textPage: "",
+          drives: [],
+        },
+      }
+    }
+    throw new Error(`Unexpected request ${pathname}`)
+  }
+
+  const exported = await core.exportSaveState(true)
+  assert.deepEqual(exported.value, {
+    filename: "wasteland.a2ts",
+    mimeType: "text/plain",
+    dataBase64: "eyJ2ZXJzaW9uIjoyfQ==",
+  })
+  assert.deepEqual(requests[0], {
+    pathname: "/api/save-states/export",
+    options: { method: "POST", body: { includeSnapshots: true } },
+  })
+  const validRequest = core.request
+  core.request = async () => ({ emulator: core.identity, state: {} })
+  await assert.rejects(core.exportSaveState(false), /invalid save-state export/)
+  assert.equal(await core.serializeMutation(async () => "export failure was non-mutating"), "export failure was non-mutating")
+  core.request = validRequest
+
+  const imported = await core.importSaveState("eyJ2ZXJzaW9uIjoyfQ==")
+  assert.equal(imported.value.runMode, "paused")
+  assert.equal(imported.value.machineName, "APPLE2EE")
+  assert.deepEqual(imported.value.drives, [])
+  assert.deepEqual(requests[1], {
+    pathname: "/api/save-states/import",
+    options: { method: "POST", body: { dataBase64: "eyJ2ZXJzaW9uIjoyfQ==" } },
+  })
+
+  core.request = async () => { throw new Error("response lost after import") }
+  await assert.rejects(core.importSaveState("eyJ2ZXJzaW9uIjoyfQ=="), /response lost after import/)
+  await assert.rejects(core.serializeMutation(async () => "blocked"), /call stop_session, then start_session/)
+})
+
 test("keyboard cleanup releases a key whose press response failed", async () => {
   const requests = []
   const core = new Apple2tsCore(
@@ -2500,6 +2618,8 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       "wait_for_execution_stop",
       "capture_screen",
       "write_memory",
+      "export_save_state",
+      "import_save_state",
       "save_session_snapshot",
       "restore_session_snapshot",
       "prepare_mount_disk",
@@ -2514,6 +2634,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       "resume",
       "set_speed",
       "set_breakpoint",
+      "set_watchpoint",
       "clear_breakpoint",
       "clear_all_breakpoints",
       "set_memory_write_watchpoint",
@@ -2583,6 +2704,25 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   const restoreSnapshotTool = tools.result.tools.find((tool) => tool.name === "restore_session_snapshot")
   assert.match(saveSnapshotTool.description, /Save or replace/)
   assert.equal(saveSnapshotTool.annotations.idempotentHint, false)
+  const exportSaveStateTool = tools.result.tools.find((tool) => tool.name === "export_save_state")
+  assert.deepEqual(exportSaveStateTool.inputSchema, {
+    type: "object",
+    properties: { includeSnapshots: { type: "boolean", default: false } },
+    additionalProperties: false,
+  })
+  assert.equal(exportSaveStateTool.outputSchema.properties.value.required.join(","), "filename,mimeType,dataBase64")
+  assert.equal(exportSaveStateTool.annotations.readOnlyHint, true)
+  assert.equal(exportSaveStateTool.annotations.destructiveHint, false)
+  const importSaveStateTool = tools.result.tools.find((tool) => tool.name === "import_save_state")
+  assert.deepEqual(importSaveStateTool.inputSchema, {
+    type: "object",
+    properties: { dataBase64: { type: "string", minLength: 1 } },
+    required: ["dataBase64"],
+    additionalProperties: false,
+  })
+  assert.equal(importSaveStateTool.annotations.destructiveHint, true)
+  assert.equal(importSaveStateTool.annotations.idempotentHint, false)
+  assert.ok(importSaveStateTool.outputSchema.properties.value.required.includes("drives"))
   assert.equal(restoreSnapshotTool.inputSchema.required[0], "snapshotId")
   assert.equal(
     restoreSnapshotTool.outputSchema.properties.value.properties.execution.properties.state.type,
@@ -2637,6 +2777,14 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.deepEqual(setBreakpointTool.outputSchema.properties.value.properties.kind.enum, ["address"])
   assert.deepEqual(setBreakpointTool.outputSchema.properties.value.properties.behavior.enum, ["pause"])
   assert.equal(setBreakpointTool.outputSchema.properties.value.properties.enabled.type, "boolean")
+  const setWatchpointTool = tools.result.tools.find((tool) => tool.name === "set_watchpoint")
+  assert.deepEqual(setWatchpointTool.inputSchema.properties.address, {
+    type: "integer", minimum: 0, maximum: 65535,
+  })
+  assert.equal(setWatchpointTool.inputSchema.properties.onRead.default, true)
+  assert.equal(setWatchpointTool.inputSchema.properties.onWrite.default, true)
+  assert.match(setWatchpointTool.description, /distinct from the ranged physical memory write watchpoint/)
+  assert.equal(setWatchpointTool.annotations.idempotentHint, true)
   const conditionalInputTool = tools.result.tools.find((tool) => tool.name === "run_input_sequence")
   assert.equal(conditionalInputTool.inputSchema.properties.phases.maxItems, 16)
   assert.equal(conditionalInputTool.inputSchema.properties.final.oneOf[0].properties.bytes.maxItems, 32)

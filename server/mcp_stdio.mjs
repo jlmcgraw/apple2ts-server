@@ -932,6 +932,47 @@ const breakpointInputSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
+const saveStateExportInputSchema = fromJsonSchema({
+  type: "object",
+  properties: { includeSnapshots: { type: "boolean", default: false } },
+  additionalProperties: false,
+})
+const saveStateExportResultSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: emulatorIdentitySchema,
+    value: {
+      type: "object",
+      properties: {
+        filename: { type: "string", minLength: 1 },
+        mimeType: { type: "string", minLength: 1 },
+        dataBase64: { type: "string", minLength: 1 },
+      },
+      required: ["filename", "mimeType", "dataBase64"],
+      additionalProperties: false,
+    },
+  },
+  required: ["emulator", "value"],
+  additionalProperties: false,
+})
+const saveStateImportInputSchema = fromJsonSchema({
+  type: "object",
+  properties: { dataBase64: { type: "string", minLength: 1 } },
+  required: ["dataBase64"],
+  additionalProperties: false,
+})
+
+const watchpointInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    address: { type: "integer", minimum: 0, maximum: 65535 },
+    onRead: { type: "boolean", default: true },
+    onWrite: { type: "boolean", default: true },
+  },
+  required: ["address"],
+  additionalProperties: false,
+})
+
 const breakpointResultSchema = (extraProperties = {}, extraRequired = []) => fromJsonSchema({
   type: "object",
   properties: {
@@ -1042,6 +1083,32 @@ const isPauseAddressBreakpoint = (breakpoint, address) => (
   && breakpoint.memoryBank === ""
   && breakpoint.action1?.action === ""
   && breakpoint.action2?.action === ""
+  && breakpoint.basic === false
+)
+
+const isMemoryAccessWatchpoint = (breakpoint, address, onRead, onWrite) => (
+  breakpoint?.address === address
+  && breakpoint.watchpoint === true
+  && breakpoint.instruction === false
+  && breakpoint.disabled === false
+  && breakpoint.hidden === false
+  && breakpoint.once === false
+  && breakpoint.memget === onRead
+  && breakpoint.memset === onWrite
+  && breakpoint.expression1?.register === ""
+  && breakpoint.expression1?.address === 0
+  && breakpoint.expression1?.operator === "=="
+  && breakpoint.expression1?.value === 0
+  && breakpoint.expression2?.register === ""
+  && breakpoint.expression2?.address === 0
+  && breakpoint.expression2?.operator === "=="
+  && breakpoint.expression2?.value === 0
+  && breakpoint.expressionOperator === ""
+  && breakpoint.hitcount === 1
+  && breakpoint.memoryBank === ""
+  && breakpoint.action1?.action === ""
+  && breakpoint.action2?.action === ""
+  && breakpoint.halt === false
   && breakpoint.basic === false
 )
 
@@ -1746,6 +1813,63 @@ export class Apple2tsCore {
     }, signal, { prepare: true })
   }
 
+  setWatchpoint(address, onRead, onWrite, signal) {
+    return this.serializeMutation(async (startMutation) => {
+      if (!onRead && !onWrite) {
+        throw new ConfirmedMutationRejection(new Error("A watchpoint must observe reads, writes, or both"))
+      }
+      const before = await this.request("/api/debug/breakpoints")
+      const existing = before.state.find((breakpoint) => breakpoint.address === address)
+      if (existing) {
+        if (!isMemoryAccessWatchpoint(existing, address, onRead, onWrite)) {
+          throw new ConfirmedMutationRejection(
+            new Error(`Breakpoint address ${address} is occupied by an incompatible debugger entry`),
+          )
+        }
+        return { emulator: before.emulator, value: { address, breakpointId: existing.breakpointId || `bp:${address}` } }
+      }
+      startMutation()
+      const result = await this.request("/api/debug/breakpoints", {
+        method: "POST",
+        body: { ...executionBreakpoint(address), watchpoint: true, instruction: false, memget: onRead, memset: onWrite },
+      })
+      if (!isMemoryAccessWatchpoint(result.state, address, onRead, onWrite)) {
+        throw new Error("Apple2TS did not confirm the requested watchpoint")
+      }
+      return {
+        emulator: result.emulator,
+        value: { address, breakpointId: result.state.breakpointId },
+      }
+    }, signal, { prepare: true })
+  }
+
+  exportSaveState(includeSnapshots, signal) {
+    return this.serializeMutation(async () => {
+      const result = await this.request("/api/save-states/export", {
+        method: "POST", body: {includeSnapshots: Boolean(includeSnapshots)},
+      }, signal)
+      const state = result.state
+      if (
+        typeof state?.filename !== "string" || !state.filename
+        || typeof state.mimeType !== "string" || !state.mimeType
+        || typeof state.dataBase64 !== "string" || !state.dataBase64
+      ) {
+        throw new Error("Apple2TS returned an invalid save-state export")
+      }
+      return {emulator: result.emulator, value: state}
+    }, signal, {prepare: true})
+  }
+
+  importSaveState(dataBase64, signal) {
+    return this.serializeMutation(async (startMutation) => {
+      startMutation()
+      const result = await this.request("/api/save-states/import", {
+        method: "POST", body: {dataBase64},
+      }, signal)
+      return {emulator: result.emulator, value: result.state}
+    }, signal, {prepare: true})
+  }
+
   clearBreakpoint(address, signal) {
     return this.serializeMutation(async () => {
       const before = await this.request("/api/debug/breakpoints")
@@ -1952,7 +2076,67 @@ export class Apple2tsCore {
 
 }
 
+const saveStateImportResultSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: emulatorIdentitySchema,
+    value: {
+      type: "object",
+      properties: {
+        runMode: { type: "string", enum: ["idle", "booting", "running", "paused", "resetting"] },
+        speedMode: { type: "integer" },
+        machineName: { type: "string" },
+        ramWorksKb: { type: "integer" },
+        debugEnabled: { type: "boolean" },
+        showDebugPanel: { type: "boolean" },
+        textPage: { type: "string" },
+        drives: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              driveId: { type: "string", enum: ["hd1", "hd2", "fd1", "fd2"] },
+              kind: { type: "string", enum: ["hard-drive", "floppy"] },
+              mounted: { type: "boolean" },
+              filename: { type: ["string", "null"] },
+              writeProtected: { type: "boolean" },
+              dirty: { type: "boolean" },
+            },
+            required: ["driveId", "kind", "mounted", "filename", "writeProtected", "dirty"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["runMode", "speedMode", "machineName", "ramWorksKb", "debugEnabled", "showDebugPanel", "textPage", "drives"],
+      additionalProperties: false,
+    },
+  },
+  required: ["emulator", "value"],
+  additionalProperties: false,
+})
+
 const mutationTools = [
+  {
+    name: "export_save_state",
+    title: "Export Apple II save state",
+    description: "Export the current emulator state as a portable base64 Apple2TS save-state payload. This is distinct from the session-only memory comparison snapshot.",
+    inputSchema: saveStateExportInputSchema,
+    outputSchema: saveStateExportResultSchema,
+    destructiveHint: false,
+    idempotentHint: true,
+    readOnlyHint: true,
+    execute: (core, input, signal) => core.exportSaveState(input.includeSnapshots ?? false, signal),
+  },
+  {
+    name: "import_save_state",
+    title: "Import Apple II save state",
+    description: "Import and restore a portable Apple2TS save-state payload. This replaces the emulator's current machine state and is destructive.",
+    inputSchema: saveStateImportInputSchema,
+    outputSchema: saveStateImportResultSchema,
+    destructiveHint: true,
+    idempotentHint: false,
+    execute: (core, input, signal) => core.importSaveState(input.dataBase64, signal),
+  },
   {
     name: "save_session_snapshot",
     title: "Save private session snapshot",
@@ -2099,6 +2283,16 @@ const mutationTools = [
     destructiveHint: false,
     idempotentHint: true,
     execute: (core, input, signal) => core.setBreakpoint(input.address, signal),
+  },
+  {
+    name: "set_watchpoint",
+    title: "Set Apple II memory watchpoint",
+    description: "Set an address-based debugger watchpoint that stops on reads, writes, or both. This is distinct from the ranged physical memory write watchpoint.",
+    inputSchema: watchpointInputSchema,
+    outputSchema: breakpointResultSchema(),
+    destructiveHint: false,
+    idempotentHint: true,
+    execute: (core, input, signal) => core.setWatchpoint(input.address, input.onRead ?? true, input.onWrite ?? true, signal),
   },
   {
     name: "clear_breakpoint",
@@ -2509,7 +2703,7 @@ export const createMcpServer = (session) => {
         inputSchema: tool.inputSchema,
         outputSchema: tool.outputSchema,
         annotations: {
-          readOnlyHint: false,
+          readOnlyHint: tool.readOnlyHint ?? false,
           destructiveHint: tool.destructiveHint,
           idempotentHint: tool.idempotentHint,
           openWorldHint: false,
