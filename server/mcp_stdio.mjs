@@ -103,6 +103,7 @@ const sessionStartInputSchema = fromJsonSchema({
   type: "object",
   properties: {
     visibility: { type: "string", enum: ["headless", "visible"] },
+    minimalUi: { type: "boolean" },
   },
   additionalProperties: false,
 })
@@ -2298,7 +2299,7 @@ export const createMcpServer = (session) => {
     "start_session",
     {
       title: "Start Apple2TS session",
-      description: "Start a headless or visible private emulator session owned by this MCP process. Omit visibility to use the configured default.",
+      description: "Start a headless or visible private emulator session owned by this MCP process. Omit visibility to use the configured default. Set minimalUi to true to render only the Apple II canvas; it defaults to false.",
       inputSchema: sessionStartInputSchema,
       outputSchema: sessionStartResultSchema,
       annotations: {
@@ -2553,13 +2554,14 @@ const waitFor = (promise, timeoutMs) =>
 
 const DEFAULT_RENDERER_DISCONNECT_GRACE_MS = 5000
 
-const launchChromium = async ({ executable, bridgeUrl, remoteControlToken, rendererId, mode }) => {
+const launchChromium = async ({ executable, bridgeUrl, remoteControlToken, rendererId, mode, minimalUi }) => {
   if (!executable) throw new Error("APPLE2TS_CHROMIUM_EXECUTABLE is required")
   await access(executable, fsConstants.X_OK)
 
   const profilePath = await mkdtemp(path.join(os.tmpdir(), "apple2ts-mcp-chromium-"))
   const launchUrl = new URL("/", bridgeUrl)
   launchUrl.searchParams.set("remoteControl", "1")
+  if (minimalUi) launchUrl.searchParams.set("remoteControlMinimal", "1")
   launchUrl.searchParams.set("remoteControlToken", remoteControlToken)
   launchUrl.searchParams.set("rendererId", rendererId)
 
@@ -2671,6 +2673,7 @@ export const runStdio = async (options = {}) => {
   let pendingCleanup = null
   let startingSession = null
   let startingSessionVisibility = null
+  let startingSessionMinimalUi = null
   let stoppingSession = null
   let lifecycleNotifier = null
   let lifecycleState = {
@@ -2743,7 +2746,8 @@ export const runStdio = async (options = {}) => {
       if (!activeSession) throw new Error("No active Apple2TS session. Call start_session first.")
       return activeSession.uploadTickets.prepareLoad(input)
     },
-    async start({ visibility } = {}) {
+    async start({ visibility, minimalUi } = {}) {
+      const minimalUiEnabled = minimalUi === true
       const chromiumMode = visibility ?? options.chromiumMode ?? "headless"
       if (chromiumMode !== "headless" && chromiumMode !== "visible") {
         throw new Error(
@@ -2764,6 +2768,9 @@ export const runStdio = async (options = {}) => {
             `Stop the active ${activeSession.visibility} session before starting a ${chromiumMode} session`,
           )
         }
+        if (minimalUi !== undefined && activeSession.minimalUi !== minimalUiEnabled) {
+          throw new Error("Stop the active session before changing minimalUi")
+        }
         return { emulator: activeSession.core.identity }
       }
       if (startingSession) {
@@ -2772,10 +2779,14 @@ export const runStdio = async (options = {}) => {
             `Wait for or stop the starting ${startingSessionVisibility} session before starting a ${chromiumMode} session`,
           )
         }
+        if (minimalUi !== undefined && startingSessionMinimalUi !== minimalUiEnabled) {
+          throw new Error("Wait for or stop the starting session before changing minimalUi")
+        }
         return startingSession
       }
 
       startingSessionVisibility = chromiumMode
+      startingSessionMinimalUi = minimalUiEnabled
       startingSession = (async () => {
         throwIfShuttingDown()
         if (!options.chromiumExecutable) throw new Error("APPLE2TS_CHROMIUM_EXECUTABLE is required")
@@ -2849,6 +2860,7 @@ export const runStdio = async (options = {}) => {
             remoteControlToken,
             rendererId,
             mode: chromiumMode,
+            minimalUi: minimalUiEnabled,
           })
           throwIfShuttingDown()
           process.stderr.write(`Apple2TS MCP private bridge listening at ${listener.url}; waiting for renderer ${rendererId}.\n`)
@@ -2870,6 +2882,7 @@ export const runStdio = async (options = {}) => {
             sessionEventFile,
             uploadTickets,
             visibility: chromiumMode,
+            minimalUi: minimalUiEnabled,
             startedAt: new Date().toISOString(),
           }
           activeSession = created
@@ -2939,6 +2952,7 @@ export const runStdio = async (options = {}) => {
       })().finally(() => {
         startingSession = null
         startingSessionVisibility = null
+        startingSessionMinimalUi = null
       })
       return startingSession
     },

@@ -2455,6 +2455,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   const launchUrl = new URL(receipt.launchUrl)
   assert.equal(launchUrl.origin, bridgeUrl)
   assert.equal(launchUrl.searchParams.get("remoteControl"), "1")
+  assert.equal(launchUrl.searchParams.get("remoteControlMinimal"), null)
   assert.equal(launchUrl.searchParams.get("remoteControlToken"), token)
   assert.equal(launchUrl.searchParams.get("rendererId"), rendererId)
   assert.equal(launchUrl.searchParams.get("controllerToken"), null)
@@ -2526,6 +2527,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     type: "object",
     properties: {
       visibility: { type: "string", enum: ["headless", "visible"] },
+      minimalUi: { type: "boolean" },
     },
     additionalProperties: false,
   })
@@ -4098,6 +4100,22 @@ test("start_session selects visibility for each new owned session", async (t) =>
   })
   assert.equal(headless.result.isError, undefined, JSON.stringify(headless))
   assert.equal((await processState.readReceipt()).headless, true)
+})
+
+test("start_session enables minimal UI only when explicitly requested", async (t) => {
+  const processState = await launchMcp()
+  t.after(processState.cleanup)
+  await processState.waitForStderr((line) => line.includes("MCP ready for session requests"))
+  await initializeMcp(processState, "minimal-ui-initialize")
+
+  const started = await startMcpSession(processState, "minimal-ui-start", { minimalUi: true })
+  assert.equal(started.result.isError, undefined, JSON.stringify(started))
+  const receipt = await processState.readReceipt()
+  assert.equal(new URL(receipt.launchUrl).searchParams.get("remoteControlMinimal"), "1")
+
+  const conflicting = await startMcpSession(processState, "minimal-ui-conflict", { minimalUi: false })
+  assert.equal(conflicting.result.isError, true)
+  assert.match(conflicting.result.content[0].text, /Stop the active session before changing minimalUi/)
 })
 
 test("start_session rejects conflicting visibility while a session starts", async (t) => {
